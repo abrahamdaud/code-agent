@@ -34,6 +34,7 @@ const (
 	ProviderCerebras       ProviderType = "cerebras"
 	ProviderAlibaba        ProviderType = "alibaba"
 	ProviderVenice         ProviderType = "venice"
+	ProviderHuggingFace    ProviderType = "huggingface"
 )
 
 type ModelInfo struct {
@@ -211,6 +212,8 @@ func NewProvider(pt ProviderType, cfg ProviderConfig, model string) (Provider, e
 		return NewAlibabaProvider(cfg, model)
 	case ProviderVenice:
 		return NewVeniceProvider(cfg, model)
+	case ProviderHuggingFace:
+		return NewHuggingFaceProvider(cfg, model)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", pt)
 	}
