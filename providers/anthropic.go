@@ -1,229 +1,107 @@
 package providers
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
-	"strings"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
 )
 
+// AnthropicProvider calls Anthropic's completion endpoint.
+// Reads ANTHROPIC_API_KEY and optional ANTHROPIC_BASE_URL from env.
 type AnthropicProvider struct {
-	config    ProviderConfig
-	model     string
+	APIKey  string
+	BaseURL string
+	Model   string
+	Client  *http.Client
 }
 
-func NewAnthropicProvider(cfg ProviderConfig, model string) (*AnthropicProvider, error) {
-	baseURL := cfg.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.anthropic.com/v1"
+func NewAnthropicProviderFromEnv() *AnthropicProvider {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	base := os.Getenv("ANTHROPIC_BASE_URL")
+	if base == "" {
+		base = "https://api.anthropic.com"
+	}
+	model := os.Getenv("ANTHROPIC_MODEL")
+	if model == "" {
+		model = "claude-2.1"
 	}
 	return &AnthropicProvider{
-		config: ProviderConfig{
-			APIKey:  cfg.APIKey,
-			BaseURL: strings.TrimRight(baseURL, "/"),
-		},
-		model: model,
-	}, nil
+		APIKey:  key,
+		BaseURL: base,
+		Model:   model,
+		Client:  &http.Client{Timeout: 30 * time.Second},
+	}
 }
 
-func (p *AnthropicProvider) Name() ProviderType {
-	return ProviderAnthropic
+func NewAnthropicProvider(apiKey, baseURL, model string) *AnthropicProvider {
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	if model == "" {
+		model = "claude-2.1"
+	}
+	return &AnthropicProvider{
+		APIKey:  apiKey,
+		BaseURL: baseURL,
+		Model:   model,
+		Client:  &http.Client{Timeout: 30 * time.Second},
+	}
 }
 
-func (p *AnthropicProvider) Models() ([]ModelInfo, error) {
-	return []ModelInfo{
-		{Provider: "anthropic", Name: "claude-sonnet-4"},
-		{Provider: "anthropic", Name: "claude-haiku-4"},
-		{Provider: "anthropic", Name: "claude-opus-4"},
-	}, nil
+type anthropicReq struct {
+	Model     string `json:"model"`
+	Prompt    string `json:"prompt"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
 }
 
-type anthropicRequest struct {
-	Model       string           `json:"model"`
-	MaxTokens   int              `json:"max_tokens"`
-	Messages    []anthropicMsg   `json:"messages"`
-	System      string           `json:"system,omitempty"`
-	Tools       []ToolDefinition `json:"tools,omitempty"`
-	Temperature float64          `json:"temperature,omitempty"`
-	Stream      bool             `json:"stream"`
+type anthropicResp struct {
+	Completion string `json:"completion"`
 }
 
-type anthropicMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+func (a *AnthropicProvider) Name() string { return "anthropic" }
 
-type anthropicResponse struct {
-	ID         string                  `json:"id"`
-	Type       string                  `json:"type"`
-	Role       string                  `json:"role"`
-	Content    []anthropicContentBlock `json:"content"`
-	StopReason string                  `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
-}
+func (a *AnthropicProvider) Complete(ctx context.Context, prompt string, options map[string]interface{}) (string, error) {
+	if a.APIKey == "" {
+		return "", fmt.Errorf("anthropic: missing API key (ANTHROPIC_API_KEY)")
+	}
 
-type anthropicContentBlock struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text,omitempty"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Input json.RawMessage `json:"input,omitempty"`
-}
+	req := anthropicReq{
+		Model:  a.Model,
+		Prompt: prompt,
+	}
+	if v, ok := options["max_tokens"].(int); ok && v > 0 {
+		req.MaxTokens = v
+	}
 
-func (p *AnthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	antReq := p.toAnthropicRequest(req)
-	body, err := json.Marshal(antReq)
+	b, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	resp, err := doJSONRequest("POST", p.config.BaseURL+"/messages",
-		bytes.NewReader(body),
-		map[string]string{
-			"x-api-key":         p.config.APIKey,
-			"anthropic-version": "2023-06-01",
-			"Content-Type":      "application/json",
-		})
+	url := fmt.Sprintf("%s/v1/complete", a.BaseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	httpReq.Header.Set("x-api-key", a.APIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
 
-	var antResp anthropicResponse
-	if err := parseJSONResponse(resp, &antResp); err != nil {
-		return nil, err
-	}
-
-	return p.toChatResponse(&antResp), nil
-}
-
-func (p *AnthropicProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamEvent, error) {
-	antReq := p.toAnthropicRequest(req)
-	antReq.Stream = true
-	body, err := json.Marshal(antReq)
+	resp, err := a.Client.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	defer resp.Body.Close()
 
-	httpResp, err := doJSONRequest("POST", p.config.BaseURL+"/messages",
-		bytes.NewReader(body),
-		map[string]string{
-			"x-api-key":         p.config.APIKey,
-			"anthropic-version": "2023-06-01",
-			"Content-Type":      "application/json",
-		})
-	if err != nil {
-		return nil, err
+	var out anthropicResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("anthropic: decode: %w", err)
 	}
-
-	events := make(chan StreamEvent, 100)
-	go p.processStream(ctx, httpResp.Body, events)
-	return events, nil
-}
-
-func (p *AnthropicProvider) processStream(ctx context.Context, body io.ReadCloser, events chan<- StreamEvent) {
-	defer body.Close()
-	defer close(events)
-
-	scanner := bufio.NewScanner(body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-		var event struct {
-			Type  string `json:"type"`
-			Delta struct {
-				Text string `json:"text"`
-			} `json:"delta"`
-			ContentBlock *anthropicContentBlock `json:"content_block,omitempty"`
-		}
-
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			continue
-		}
-
-		switch event.Type {
-		case "content_block_delta":
-			if event.Delta.Text != "" {
-				events <- StreamEvent{
-					Type:    StreamEventText,
-					Content: event.Delta.Text,
-				}
-			}
-		case "message_stop":
-			events <- StreamEvent{Type: StreamEventDone, Done: true}
-			return
-		}
+	if out.Completion == "" {
+		return "", fmt.Errorf("anthropic: empty completion")
 	}
-}
-
-func (p *AnthropicProvider) toAnthropicRequest(req *ChatRequest) *anthropicRequest {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
-	}
-
-	messages := make([]anthropicMsg, 0)
-	var system string
-
-	for _, m := range req.Messages {
-		if m.Role == "system" {
-			system = m.Content
-			continue
-		}
-		messages = append(messages, anthropicMsg{
-			Role:    m.Role,
-			Content: m.Content,
-		})
-	}
-
-	maxTokens := req.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 8192
-	}
-
-	return &anthropicRequest{
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Messages:    messages,
-		System:      system,
-		Tools:       req.Tools,
-		Temperature: req.Temperature,
-	}
-}
-
-func (p *AnthropicProvider) toChatResponse(resp *anthropicResponse) *ChatResponse {
-	cr := &ChatResponse{
-		FinishReason: resp.StopReason,
-		Usage: Usage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		},
-	}
-
-	for _, block := range resp.Content {
-		switch block.Type {
-		case "text":
-			cr.Content += block.Text
-		case "tool_use":
-			args, _ := json.Marshal(block.Input)
-			tc := ToolCall{
-				ID:   block.ID,
-				Type: "function",
-			}
-			tc.Function.Name = block.Name
-			tc.Function.Arguments = string(args)
-			cr.ToolCalls = append(cr.ToolCalls, tc)
-		}
-	}
-
-	return cr
+	return out.Completion, nil
 }
