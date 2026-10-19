@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/glebarez/sqlite"
 )
 
 type Store struct {
@@ -20,16 +20,23 @@ type Store struct {
 
 func NewStore(dataDir string) (*Store, error) {
 	storeDir := filepath.Join(dataDir, "sessions")
-	os.MkdirAll(storeDir, 0755)
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create store dir: %w", err)
+	}
 	dbPath := filepath.Join(storeDir, "sessions.db")
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
 	s := &Store{db: db, dir: storeDir}
 	if err := s.migrate(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("migration failed: %w", err)
 	}
 	return s, nil
@@ -53,7 +60,6 @@ func (s *Store) SaveRaw(id, data string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Extract title quickly
 	var title string
 	var sess struct {
 		Title string `json:"title"`
